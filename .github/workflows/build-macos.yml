@@ -1,0 +1,93 @@
+name: Build PADI_REPORT_MANAGERV27 for Apple Silicon
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Confirm architecture
+        run: |
+          uname -m
+          python -c 'import platform; assert platform.machine() == "arm64", platform.machine()'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --prefer-binary 'pyinstaller>=6.11,<7' 'pillow>=10,<13' 'pypdf>=5,<7' 'pypdfium2>=4.30,<6' 'reportlab>=4,<5'
+      - name: Validate source and imports
+        run: |
+          python -m py_compile PADI_REPORT_MANAGERV27.py
+          python -c 'import tkinter, PIL, pypdf, pypdfium2, reportlab; print("Dependencies OK")'
+      - name: Build native arm64 app
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --onedir \
+            --name 'PADI Manager' \
+            --osx-bundle-identifier 'ca.padi.manager.steiner' \
+            --target-arch arm64 \
+            --collect-all pypdfium2 \
+            PADI_REPORT_MANAGERV27.py
+          test -d 'dist/PADI Manager.app'
+          codesign --verify --deep --strict --verbose=2 'dist/PADI Manager.app'
+          file 'dist/PADI Manager.app/Contents/MacOS/PADI Manager'
+      - name: Import Developer ID certificate (optional)
+        if: ${{ env.HAVE_CERT == 'true' }}
+        env:
+          HAVE_CERT: ${{ secrets.MAC_CERT_P12_BASE64 != '' && secrets.MAC_CERT_PASSWORD != '' && secrets.MAC_SIGN_IDENTITY != '' }}
+          CERT_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/padi-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          echo "$CERT_BASE64" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+      - name: Sign with Developer ID (optional)
+        if: ${{ env.HAVE_CERT == 'true' }}
+        env:
+          HAVE_CERT: ${{ secrets.MAC_CERT_P12_BASE64 != '' && secrets.MAC_CERT_PASSWORD != '' && secrets.MAC_SIGN_IDENTITY != '' }}
+          SIGN_IDENTITY: ${{ secrets.MAC_SIGN_IDENTITY }}
+        run: |
+          # Sign nested binaries from deepest to shallowest before signing the bundle.
+          APP='dist/PADI Manager.app'
+          while IFS= read -r -d '' binary; do
+            codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$binary"
+          done < <(find "$APP/Contents" -type f \( -name '*.so' -o -name '*.dylib' \) -print0)
+          codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+      - name: Package drag-and-drop DMG
+        run: |
+          mkdir -p staging
+          ditto 'dist/PADI Manager.app' 'staging/PADI Manager.app'
+          ln -s /Applications 'staging/Applications'
+          hdiutil create -volname 'PADI Manager' -srcfolder staging -ov -format UDZO 'PADI_REPORT_MANAGERV27_Apple_Silicon.dmg'
+      - name: Notarize and staple DMG (optional)
+        if: ${{ env.HAVE_NOTARY == 'true' && env.HAVE_CERT == 'true' }}
+        env:
+          HAVE_CERT: ${{ secrets.MAC_CERT_P12_BASE64 != '' && secrets.MAC_CERT_PASSWORD != '' && secrets.MAC_SIGN_IDENTITY != '' }}
+          HAVE_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_APP_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit 'PADI_REPORT_MANAGERV27_Apple_Silicon.dmg' \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple 'PADI_REPORT_MANAGERV27_Apple_Silicon.dmg'
+          xcrun stapler validate 'PADI_REPORT_MANAGERV27_Apple_Silicon.dmg'
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: PADI_REPORT_MANAGERV27_Apple_Silicon-DMG
+          path: PADI_REPORT_MANAGERV27_Apple_Silicon.dmg
+          if-no-files-found: error
